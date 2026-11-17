@@ -5,6 +5,7 @@
 #pragma once
 
 // platform includes
+#include <atomic>
 #include <d3d11.h>
 #include <d3d11_4.h>
 #include <d3dcommon.h>
@@ -211,6 +212,23 @@ namespace platf::dxgi {
   fp16_transfer_e select_fp16_transfer(DXGI_FORMAT format, bool hdr, bool gamma_encoded_sdr);
 
   class hwdevice_t;
+
+  /**
+   * @brief Report whether capture of a single application window was requested.
+   *
+   * Window capture is enabled by setting the environment variable `SUNSHINE_CAPTURE_APP`
+   * to a process name (e.g. `notepad.exe`) or part of a window title.
+   *
+   * @return True when `SUNSHINE_CAPTURE_APP` is set and not empty.
+   */
+  bool window_capture_requested();
+
+  /**
+   * @brief Find the top-level window matching `SUNSHINE_CAPTURE_APP`.
+   *
+   * @return Handle of the largest matching visible window, or nullptr when none was found.
+   */
+  HWND find_capture_window();
 
   /**
    * @brief Cursor position and visibility for the current capture frame.
@@ -766,6 +784,12 @@ namespace platf::dxgi {
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame consumed_frame {nullptr};
     SRWLOCK frame_lock = SRWLOCK_INIT;
     CONDITION_VARIABLE frame_present_cv;
+
+    // window capture state (SUNSHINE_CAPTURE_APP)
+    HWND target_window = nullptr;
+    winrt::Windows::Graphics::SizeInt32 last_size {};
+    std::atomic<bool> item_closed {false};
+    winrt::event_token closed_token {};
 
     void on_frame_arrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const &sender, winrt::Windows::Foundation::IInspectable const &);
 

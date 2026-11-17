@@ -4,10 +4,15 @@
  */
 // platform includes
 #include <dxgi1_2.h>
+#include <atomic>
+#include <cwctype>
+#include <string>
+#include <vector>
 
 // local includes
 #include "display.h"
 #include "misc.h"
+#include "utf_utils.h"
 #include "src/logging.h"
 
 // Gross hack to work around MINGW-packages#22160
@@ -80,11 +85,249 @@ constexpr auto __mingw_uuidof<winrt::IDirect3DDxgiInterfaceAccess>() -> GUID con
 #endif
 
 namespace platf::dxgi {
+  namespace {
+    std::wstring to_lower(std::wstring str) {
+      for (auto &c : str) {
+        c = (wchar_t) towlower(c);
+      }
+      return str;
+    }
+
+    std::wstring get_target_app() {
+      wchar_t buf[512];
+      DWORD len = GetEnvironmentVariableW(L"SUNSHINE_CAPTURE_APP", buf, 512);
+      if (len == 0 || len >= 512) {
+        return {};
+      }
+      std::wstring value = to_lower(std::wstring(buf, len));
+      // trim surrounding spaces and quotes
+      const wchar_t *trim = L" \t\"";
+      auto first = value.find_first_not_of(trim);
+      if (first == std::wstring::npos) {
+        return {};
+      }
+      auto last = value.find_last_not_of(trim);
+      return value.substr(first, last - first + 1);
+    }
+
+    using DwmGetWindowAttribute_t = HRESULT(WINAPI *)(HWND, DWORD, PVOID, DWORD);
+
+    DwmGetWindowAttribute_t get_dwm_attribute_fn() {
+      static DwmGetWindowAttribute_t fn = []() -> DwmGetWindowAttribute_t {
+        auto lib = LoadLibraryW(L"dwmapi.dll");
+        return lib ? (DwmGetWindowAttribute_t) GetProcAddress(lib, "DwmGetWindowAttribute") : nullptr;
+      }();
+      return fn;
+    }
+
+    /**
+     * @brief Visible window bounds (without invisible resize borders) in virtual desktop coordinates.
+     */
+    bool get_visible_bounds(HWND hwnd, RECT &rect) {
+      constexpr DWORD DWMWA_EXTENDED_FRAME_BOUNDS_ = 9;
+      auto fn = get_dwm_attribute_fn();
+      if (fn && SUCCEEDED(fn(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS_, &rect, sizeof(rect)))) {
+        return true;
+      }
+      return GetWindowRect(hwnd, &rect) != 0;
+    }
+
+    bool is_cloaked(HWND hwnd) {
+      constexpr DWORD DWMWA_CLOAKED_ = 14;
+      auto fn = get_dwm_attribute_fn();
+      DWORD cloaked = 0;
+      return fn && SUCCEEDED(fn(hwnd, DWMWA_CLOAKED_, &cloaked, sizeof(cloaked))) && cloaked != 0;
+    }
+
+    std::wstring get_title(HWND hwnd) {
+      wchar_t title[512] = {};
+      int len = GetWindowTextW(hwnd, title, 512);
+      return len > 0 ? std::wstring(title, len) : std::wstring();
+    }
+
+    std::wstring get_class(HWND hwnd) {
+      wchar_t name[256] = {};
+      int len = GetClassNameW(hwnd, name, 256);
+      return len > 0 ? std::wstring(name, len) : std::wstring();
+    }
+
+    /**
+     * @brief Lower case executable file name (e.g. `notepad.exe`) of the process that owns the window.
+     */
+    std::wstring get_exe_name(HWND hwnd, DWORD *pid_out = nullptr) {
+      DWORD pid = 0;
+      GetWindowThreadProcessId(hwnd, &pid);
+      if (pid_out) {
+        *pid_out = pid;
+      }
+      std::wstring exe;
+      if (HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+        wchar_t path[MAX_PATH] = {};
+        DWORD size = MAX_PATH;
+        if (QueryFullProcessImageNameW(proc, 0, path, &size)) {
+          exe = to_lower(std::wstring(path, size));
+          auto slash = exe.find_last_of(L"\\/");
+          if (slash != std::wstring::npos) {
+            exe = exe.substr(slash + 1);
+          }
+        }
+        CloseHandle(proc);
+      }
+      return exe;
+    }
+
+    bool is_internal_exe(const std::wstring &exe) {
+      static const wchar_t *internal[] = {
+        L"startmenuexperiencehost.exe",
+        L"applicationframehost.exe",
+        L"peopleexperiencehost.exe",
+        L"shellexperiencehost.exe",
+        L"systemsettings.exe",
+        L"textinputhost.exe",
+        L"searchapp.exe",
+        L"searchui.exe",
+        L"lockapp.exe",
+        L"gamebar.exe",
+        L"tabtip.exe",
+      };
+      for (auto name : internal) {
+        if (exe == name) {
+          return true;
+        }
+      }
+      return exe.rfind(L"windowsinternal", 0) == 0;
+    }
+
+    /**
+     * @brief UWP apps live in an `ApplicationFrameWindow`; the real window is a child owned by another process.
+     */
+    HWND get_uwp_actual_window(HWND parent) {
+      auto cls = get_class(parent);
+      if (cls != L"ApplicationFrameWindow" && cls != L"WinUIDesktopWin32WindowClass") {
+        return nullptr;
+      }
+      DWORD parent_pid = 0;
+      GetWindowThreadProcessId(parent, &parent_pid);
+      for (HWND child = FindWindowExW(parent, nullptr, nullptr, nullptr); child; child = FindWindowExW(parent, child, nullptr, nullptr)) {
+        DWORD child_pid = 0;
+        GetWindowThreadProcessId(child, &child_pid);
+        if (child_pid != parent_pid) {
+          return child;
+        }
+      }
+      return nullptr;
+    }
+
+    struct window_candidate_t {
+      HWND hwnd;  // window handed to Windows.Graphics.Capture
+      std::wstring exe;
+      std::wstring title;
+      long long area;
+    };
+
+    BOOL CALLBACK enum_windows_cb(HWND hwnd, LPARAM lparam) {
+      auto *list = (std::vector<window_candidate_t> *) lparam;
+
+      if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || is_cloaked(hwnd)) {
+        return TRUE;
+      }
+      if (GetWindow(hwnd, GW_OWNER) != nullptr || (GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) {
+        return TRUE;
+      }
+
+      RECT client {};
+      if (!GetClientRect(hwnd, &client) || client.right <= 0 || client.bottom <= 0) {
+        return TRUE;
+      }
+
+      RECT wr {};
+      if (!GetWindowRect(hwnd, &wr)) {
+        return TRUE;
+      }
+
+      HWND capture_hwnd = hwnd;
+      if (HWND actual = get_uwp_actual_window(hwnd)) {
+        capture_hwnd = actual;
+      }
+
+      DWORD pid = 0;
+      auto exe = get_exe_name(capture_hwnd, &pid);
+      if (pid == GetCurrentProcessId() || is_internal_exe(exe)) {
+        return TRUE;
+      }
+
+      auto title = get_title(hwnd);
+      if (exe == L"explorer.exe" && title.empty()) {
+        return TRUE;
+      }
+
+      list->push_back({capture_hwnd, exe, title, (long long) (wr.right - wr.left) * (wr.bottom - wr.top)});
+      return TRUE;
+    }
+
+    std::vector<window_candidate_t> list_windows() {
+      std::vector<window_candidate_t> list;
+      EnumWindows(enum_windows_cb, (LPARAM) &list);
+      return list;
+    }
+  }  // namespace
+
+  bool window_capture_requested() {
+    return !get_target_app().empty();
+  }
+
+  HWND find_capture_window() {
+    auto needle = get_target_app();
+    if (needle.empty()) {
+      return nullptr;
+    }
+
+    auto windows = list_windows();
+
+    // rank: 3 = exact executable name, 2 = executable name contains text, 1 = title contains text
+    const window_candidate_t *best = nullptr;
+    int best_rank = 0;
+    for (const auto &w : windows) {
+      int rank = 0;
+      if (w.exe == needle || w.exe == needle + L".exe") {
+        rank = 3;
+      } else if (!w.exe.empty() && w.exe.find(needle) != std::wstring::npos) {
+        rank = 2;
+      } else if (to_lower(w.title).find(needle) != std::wstring::npos) {
+        rank = 1;
+      }
+      if (rank == 0) {
+        continue;
+      }
+      if (!best || rank > best_rank || (rank == best_rank && w.area > best->area)) {
+        best = &w;
+        best_rank = rank;
+      }
+    }
+
+    if (best) {
+      BOOST_LOG(info) << "Window capture target: ["sv << utf_utils::to_utf8(best->exe.c_str()) << "] "sv << utf_utils::to_utf8(best->title.c_str());
+      return best->hwnd;
+    }
+
+    BOOST_LOG(warning) << "No window matched SUNSHINE_CAPTURE_APP=\""sv << utf_utils::to_utf8(needle.c_str()) << "\". Visible windows:"sv;
+    for (const auto &w : windows) {
+      BOOST_LOG(warning) << "  ["sv << utf_utils::to_utf8(w.exe.c_str()) << "] "sv << utf_utils::to_utf8(w.title.c_str());
+    }
+    return nullptr;
+  }
+
   wgc_capture_t::wgc_capture_t() {
     InitializeConditionVariable(&frame_present_cv);
   }
 
   wgc_capture_t::~wgc_capture_t() {
+    if (item && closed_token.value) {
+      try {
+        item.Closed(closed_token);
+      } catch (...) {
+      }
+    }
     if (capture_session) {
       capture_session.Close();
     }
@@ -127,7 +370,57 @@ namespace platf::dxgi {
     display->output->GetDesc(&output_desc);
 
     auto monitor_factory = winrt::get_activation_factory<winrt::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
-    if (monitor_factory == nullptr || FAILED(status = monitor_factory->CreateForMonitor(output_desc.Monitor, winrt::guid_of<winrt::IGraphicsCaptureItem>(), winrt::put_abi(item)))) {
+    if (monitor_factory == nullptr) {
+      BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows: no capture interop factory"sv;
+      return -1;
+    }
+
+    if (window_capture_requested()) {
+      // Capture a single application window instead of the whole monitor
+      HWND target = find_capture_window();
+      if (target == nullptr) {
+        BOOST_LOG(error) << "SUNSHINE_CAPTURE_APP is set but no matching visible window was found. Is the application running and not minimized?"sv;
+        return -1;
+      }
+
+      if (FAILED(status = monitor_factory->CreateForWindow(target, winrt::guid_of<winrt::IGraphicsCaptureItem>(), winrt::put_abi(item)))) {
+        BOOST_LOG(error) << "Failed to capture the target window [0x"sv << util::hex(status).to_string_view() << ']';
+        return -1;
+      }
+
+      try {
+        auto size = item.Size();
+        if (size.Width <= 0 || size.Height <= 0) {
+          BOOST_LOG(error) << "Target window has an invalid size"sv;
+          return -1;
+        }
+
+        display->width = size.Width;
+        display->height = size.Height;
+        display->width_before_rotation = size.Width;
+        display->height_before_rotation = size.Height;
+        display->display_rotation = DXGI_MODE_ROTATION_IDENTITY;
+
+        // Map absolute mouse input onto the window instead of the monitor
+        RECT bounds;
+        if (get_visible_bounds(target, bounds)) {
+          display->offset_x = bounds.left - GetSystemMetrics(SM_XVIRTUALSCREEN);
+          display->offset_y = bounds.top - GetSystemMetrics(SM_YVIRTUALSCREEN);
+        }
+
+        target_window = target;
+        last_size = size;
+        item_closed = false;
+        closed_token = item.Closed([this](winrt::GraphicsCaptureItem const &, winrt::IInspectable const &) {
+          item_closed = true;
+        });
+
+        BOOST_LOG(info) << "Capturing window "sv << size.Width << 'x' << size.Height;
+      } catch (winrt::hresult_error &e) {
+        BOOST_LOG(error) << "Failed to set up window capture: [0x"sv << util::hex(e.code()).to_string_view() << ']';
+        return -1;
+      }
+    } else if (FAILED(status = monitor_factory->CreateForMonitor(output_desc.Monitor, winrt::guid_of<winrt::IGraphicsCaptureItem>(), winrt::put_abi(item)))) {
       BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows: failed to acquire display: [0x"sv << util::hex(status).to_string_view() << ']';
       return -1;
     }
@@ -205,6 +498,27 @@ namespace platf::dxgi {
   capture_e wgc_capture_t::next_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out, uint64_t &out_time) {
     // this CONSUMER runs in the capture thread
     release_frame();
+
+    if (target_window) {
+      // The captured window went away or changed size: rebuild the capture so the
+      // frame pool and the stream geometry follow the window.
+      try {
+        if (item_closed.load() || !IsWindow(target_window)) {
+          BOOST_LOG(warning) << "Captured window was closed"sv;
+          return capture_e::reinit;
+        }
+        if (IsIconic(target_window)) {
+          return capture_e::timeout;  // minimized: no frames until it is restored
+        }
+        auto size = item.Size();
+        if (size.Width != last_size.Width || size.Height != last_size.Height) {
+          BOOST_LOG(info) << "Captured window resized to "sv << size.Width << 'x' << size.Height;
+          return capture_e::reinit;
+        }
+      } catch (winrt::hresult_error &) {
+        return capture_e::reinit;
+      }
+    }
 
     AcquireSRWLockExclusive(&frame_lock);
     if (produced_frame == nullptr && SleepConditionVariableSRW(&frame_present_cv, &frame_lock, timeout.count(), 0) == 0) {

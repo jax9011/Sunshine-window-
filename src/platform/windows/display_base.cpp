@@ -1027,7 +1027,7 @@ namespace platf {
    * @param hwdevice_type enables possible use of hardware encoder
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
-    if (config::video.capture == "ddx" || config::video.capture.empty()) {
+    if (!dxgi::window_capture_requested() && (config::video.capture == "ddx" || config::video.capture.empty())) {
       if (hwdevice_type == mem_type_e::dxgi) {
         auto disp = std::make_shared<dxgi::display_ddup_vram_t>();
 
@@ -1043,7 +1043,7 @@ namespace platf {
       }
     }
 
-    if (config::video.capture == "wgc" || config::video.capture.empty()) {
+    if (config::video.capture == "wgc" || config::video.capture.empty() || dxgi::window_capture_requested()) {
       if (hwdevice_type == mem_type_e::dxgi) {
         auto disp = std::make_shared<dxgi::display_wgc_vram_t>();
 
