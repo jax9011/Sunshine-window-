@@ -6,6 +6,7 @@
 #include <dxgi1_2.h>
 #include <atomic>
 #include <cwctype>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -93,21 +94,75 @@ namespace platf::dxgi {
       return str;
     }
 
-    std::wstring get_target_app() {
-      wchar_t buf[512];
-      DWORD len = GetEnvironmentVariableW(L"SUNSHINE_CAPTURE_APP", buf, 512);
-      if (len == 0 || len >= 512) {
+    /**
+     * @brief Read a string value from the registry.
+     */
+    std::wstring read_registry_string(HKEY root, const wchar_t *subkey, const wchar_t *name) {
+      HKEY key = nullptr;
+      if (RegOpenKeyExW(root, subkey, 0, KEY_READ, &key) != ERROR_SUCCESS) {
         return {};
       }
-      std::wstring value = to_lower(std::wstring(buf, len));
-      // trim surrounding spaces and quotes
+
+      wchar_t buf[512] = {};
+      DWORD size = sizeof(buf) - sizeof(wchar_t);
+      DWORD type = 0;
+      std::wstring value;
+      if (RegQueryValueExW(key, name, nullptr, &type, (LPBYTE) buf, &size) == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ)) {
+        value.assign(buf, size / sizeof(wchar_t));
+        while (!value.empty() && value.back() == L'\0') {
+          value.pop_back();
+        }
+      }
+      RegCloseKey(key);
+      return value;
+    }
+
+    /**
+     * @brief Get the requested target application (lower case, trimmed), or an empty string.
+     *
+     * The process environment is checked first. When Sunshine was started by a parent process that
+     * does not have the variable (for example a service, or Explorer started before `setx` ran),
+     * the user and system environment stored in the registry are used as a fallback.
+     */
+    std::wstring get_target_app() {
+      std::wstring value;
+      const wchar_t *source = L"environment";
+
+      wchar_t buf[512];
+      DWORD len = GetEnvironmentVariableW(L"SUNSHINE_CAPTURE_APP", buf, 512);
+      if (len > 0 && len < 512) {
+        value.assign(buf, len);
+      }
+
+      if (value.find_first_not_of(L" \t\"") == std::wstring::npos) {
+        value = read_registry_string(HKEY_CURRENT_USER, L"Environment", L"SUNSHINE_CAPTURE_APP");
+        source = L"user registry";
+      }
+      if (value.find_first_not_of(L" \t\"") == std::wstring::npos) {
+        value = read_registry_string(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", L"SUNSHINE_CAPTURE_APP");
+        source = L"system registry";
+      }
+
+      value = to_lower(value);
       const wchar_t *trim = L" \t\"";
       auto first = value.find_first_not_of(trim);
       if (first == std::wstring::npos) {
         return {};
       }
       auto last = value.find_last_not_of(trim);
-      return value.substr(first, last - first + 1);
+      value = value.substr(first, last - first + 1);
+
+      // log the setting once per value so it is visible in the log
+      static std::mutex log_mutex;
+      static std::wstring logged;
+      {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        if (logged != value) {
+          logged = value;
+          BOOST_LOG(info) << "SUNSHINE_CAPTURE_APP = \""sv << utf_utils::to_utf8(value.c_str()) << "\" (from "sv << utf_utils::to_utf8(source) << ')';
+        }
+      }
+      return value;
     }
 
     using DwmGetWindowAttribute_t = HRESULT(WINAPI *)(HWND, DWORD, PVOID, DWORD);
